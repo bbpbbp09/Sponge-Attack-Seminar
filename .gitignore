@@ -1,0 +1,21 @@
+# Ignore everything by default
+*
+
+# Include these file types
+!*.py
+!*.png
+!Dockerfile
+!.gitignore
+!README.md
+
+# Include data folder
+!data/
+!data/**
+
+# Exclude Python cache
+__pycache__/
+*.pyc
+
+# Exclude numpy files (too large, not needed for repo)
+*.npy
+*.npz
