@@ -11,7 +11,7 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /app
 
-# Install Python dependencies (simplified - no pytorch-forecasting)
+# Install Python dependencies
 RUN pip install --no-cache-dir \
     torch \
     pygad \
@@ -19,10 +19,15 @@ RUN pip install --no-cache-dir \
     matplotlib \
     pandas \
     numpy \
-    scipy
+    scipy \
+    transformers \
+    accelerate \
+    chronos-forecasting \
+    pypower
 
 # Copy the application code
 COPY . /app
 
 # Default: train the model first
 CMD ["python", "train_deepar.py"]
+

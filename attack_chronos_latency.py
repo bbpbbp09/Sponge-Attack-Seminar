@@ -4,12 +4,11 @@ import numpy as np
 import pygad
 import argparse
 import matplotlib.pyplot as plt
+from chronos import ChronosPipeline
 
-from config import (CONTEXT_LEN, PREDICTION_LEN, NUM_FEATURES, HIDDEN_SIZE, RNN_LAYERS,
-                    DEEPAR_MODEL_PATH, DATA_PATH, ALL_FEATURES, POPULATION_SIZE,
-                    NUM_PARENTS_MATING, MUTATION_PERCENT, KEEP_ELITISM,
+from config import (CONTEXT_LEN, PREDICTION_LEN, NUM_FEATURES, DATA_PATH, ALL_FEATURES,
+                    POPULATION_SIZE, NUM_PARENTS_MATING, MUTATION_PERCENT, KEEP_ELITISM,
                     REPS_PER_MEASUREMENT, WARMUP_REPS)
-from models.deepar import DeepARLSTM
 from utils.power_monitor import PowerMonitor
 from utils.data_loader import load_seed_data
 from utils.metrics import measure_latency
@@ -23,39 +22,39 @@ NUM_GENERATIONS = args.generations
 MODE = args.mode
 
 print("="*70)
-print("DeepAR LATENCY ATTACK - Maximizing Inference Time")
+print("CHRONOS LATENCY ATTACK")
 print("="*70)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 power_monitor = PowerMonitor(0.001)
 
-print("\nLoading DeepAR model...")
-checkpoint = torch.load(DEEPAR_MODEL_PATH, map_location=device)
-model = DeepARLSTM(
-    input_size=NUM_FEATURES, hidden_size=HIDDEN_SIZE,
-    num_layers=RNN_LAYERS, output_size=PREDICTION_LEN, dropout=0.1
-).to(device)
-model.load_state_dict(checkpoint['model_state_dict'])
-model.eval()
+print("\nLoading Chronos model...")
+pipeline = ChronosPipeline.from_pretrained(
+    "amazon/chronos-t5-base",
+    device_map=device,
+    torch_dtype=torch.float32,
+)
 
-norm_params = checkpoint.get('norm_params', None)
-seed_data, mean, std = load_seed_data(DATA_PATH, CONTEXT_LEN, norm_params)
+seed_data, mean, std = load_seed_data(DATA_PATH, CONTEXT_LEN)
 flat_seed = seed_data.flatten()
 
 def make_prediction(input_array):
-    x = torch.tensor(input_array, dtype=torch.float32).unsqueeze(0).to(device)
-    with torch.no_grad():
-        return model(x)
+    if len(input_array.shape) == 2:
+        univariate = input_array[:, 0]
+    else:
+        univariate = input_array
+    inp = torch.tensor(univariate, dtype=torch.float32)
+    pipeline.predict(inp, prediction_length=PREDICTION_LEN)
 
 print("\nMeasuring baseline...")
 baseline_stats = measure_latency(make_prediction, seed_data, power_monitor, device, num_reps=50)
 BASELINE_LATENCY = baseline_stats['latency']
 BASELINE_POWER = baseline_stats['avg_power']
-print(f"Baseline Latency: {BASELINE_LATENCY*1000:.3f}ms, Power: {BASELINE_POWER:.1f}W")
+print(f"Baseline Latency: {BASELINE_LATENCY*1000:.3f}ms")
 
 generation_data = {
     'gen': [], 'max_fitness': [], 'avg_fitness': [],
-    'best_latency': [], 'best_latency_std': [], 'best_power': [], 'best_cpu_percent': [],
+    'best_latency': [], 'best_power': [], 'best_cpu_percent': [],
     'global_best_fitness': [], 'global_max_latency': []
 }
 hall_of_fame = []
@@ -69,20 +68,15 @@ def fitness_func(ga_instance, solution, solution_idx):
     input_array = solution.reshape(CONTEXT_LEN, NUM_FEATURES).astype(np.float32)
     stats = measure_latency(make_prediction, input_array, power_monitor, device, REPS_PER_MEASUREMENT)
     latency_ratio = stats['latency'] / BASELINE_LATENCY if BASELINE_LATENCY > 0 else 1.0
-    fitness = (latency_ratio * 100) - (2.0 * (stats['latency_std'] / BASELINE_LATENCY * 100))
-    if fitness < 0:
-        fitness = 0
+    fitness = latency_ratio * 100
     current_gen_fitness.append(fitness)
     current_gen_solutions.append({
         'fitness': fitness, 'latency': stats['latency'],
-        'latency_std': stats['latency_std'], 'power': stats['avg_power'],
-        'cpu_percent': stats['avg_cpu_percent'], 'solution': solution.copy()
+        'power': stats['avg_power'], 'cpu_percent': stats['avg_cpu_percent'],
+        'solution': solution.copy()
     })
     if fitness > global_best['fitness']:
-        global_best = {
-            'fitness': fitness, 'latency': stats['latency'],
-            'power': stats['avg_power'], 'solution': solution.copy()
-        }
+        global_best = {'fitness': fitness, 'latency': stats['latency'], 'power': stats['avg_power'], 'solution': solution.copy()}
     if stats['latency'] > global_max_latency:
         global_max_latency = stats['latency']
     hall_of_fame.append({'fitness': fitness, 'latency': stats['latency'], 'solution': solution.copy()})
@@ -96,13 +90,11 @@ def on_generation(ga_instance):
     gen = ga_instance.generations_completed
     if current_gen_fitness:
         max_fit = max(current_gen_fitness)
-        avg_fit = np.mean(current_gen_fitness)
         best = max(current_gen_solutions, key=lambda x: x['fitness'])
         generation_data['gen'].append(gen)
         generation_data['max_fitness'].append(max_fit)
-        generation_data['avg_fitness'].append(avg_fit)
+        generation_data['avg_fitness'].append(np.mean(current_gen_fitness))
         generation_data['best_latency'].append(best['latency'])
-        generation_data['best_latency_std'].append(best['latency_std'])
         generation_data['best_power'].append(best['power'])
         generation_data['best_cpu_percent'].append(best.get('cpu_percent', 0))
         generation_data['global_best_fitness'].append(global_best['fitness'])
@@ -113,35 +105,30 @@ def on_generation(ga_instance):
     current_gen_solutions = []
 
 def latency_mutation(offspring, ga_instance):
+    bin_hop_min = 0.1
     for idx in range(offspring.shape[0]):
         for gene_idx in range(offspring.shape[1]):
             if np.random.random() < MUTATION_PERCENT / 100:
                 mutation_type = np.random.random()
-                if mutation_type < 0.40:
-                    if np.random.random() < 0.5:
-                        offspring[idx, gene_idx] = np.random.uniform(1.5, 3.0)
-                    else:
-                        offspring[idx, gene_idx] = np.random.uniform(-3.0, -1.5)
-                elif mutation_type < 0.70:
-                    offspring[idx, gene_idx] = np.float32(np.random.choice([
-                        1e-42, 1e-43, 1e-44, 1e-45, -1e-42, -1e-43, -1e-44, -1e-45
-                    ]))
+                val = offspring[idx, gene_idx]
+                if mutation_type < 0.50:
+                    direction = np.random.choice([1, -1])
+                    jump = np.random.uniform(bin_hop_min, 2.0)
+                    offspring[idx, gene_idx] = val + (direction * jump)
+                elif mutation_type < 0.75:
+                    offspring[idx, gene_idx] = np.random.uniform(-1e4, 1e4)
                 else:
-                    offspring[idx, gene_idx] = np.random.uniform(-5.0, 5.0)
+                    offspring[idx, gene_idx] = np.random.normal(0, 0.5)
     return offspring
 
 def time_slice_crossover(parents, offspring_size, ga_instance):
     offspring = []
     idx = 0
     while len(offspring) != offspring_size[0]:
-        parent1 = parents[idx % parents.shape[0], :].copy()
-        parent2 = parents[(idx + 1) % parents.shape[0], :].copy()
-        p1_reshaped = parent1.reshape(CONTEXT_LEN, NUM_FEATURES)
-        p2_reshaped = parent2.reshape(CONTEXT_LEN, NUM_FEATURES)
+        p1 = parents[idx % parents.shape[0], :].reshape(CONTEXT_LEN, NUM_FEATURES)
+        p2 = parents[(idx + 1) % parents.shape[0], :].reshape(CONTEXT_LEN, NUM_FEATURES)
         crossover_pt = np.random.randint(1, CONTEXT_LEN)
-        child = np.zeros_like(p1_reshaped)
-        child[:crossover_pt, :] = p1_reshaped[:crossover_pt, :]
-        child[crossover_pt:, :] = p2_reshaped[crossover_pt:, :]
+        child = np.vstack([p1[:crossover_pt, :], p2[crossover_pt:, :]])
         offspring.append(child.flatten())
         idx += 1
     return np.array(offspring)
@@ -154,27 +141,20 @@ if MODE == "constrained":
         initial_population.append(flat_seed + np.random.normal(0, 0.5, n))
     gene_space = {'low': -10.0, 'high': 10.0}
 else:
-    n_per = POPULATION_SIZE // 5
+    n_per = POPULATION_SIZE // 4
     for _ in range(n_per):
-        initial_population.append(np.random.choice([1e-42, 1e-43, 1e-44, 1e-45, -1e-42, -1e-43], n).astype(np.float32))
-    for _ in range(n_per):
-        initial_population.append(np.random.uniform(-1e35, 1e35, n).astype(np.float32))
+        initial_population.append(np.random.uniform(-50, 50, n))
     for _ in range(n_per):
         x = np.zeros(n)
-        for i in range(n):
-            x[i] = 10 ** np.random.uniform(-40, 35)
-            if np.random.random() < 0.5:
-                x[i] = -x[i]
-        initial_population.append(x.astype(np.float32))
+        x[::2] = np.random.uniform(10, 100, len(x[::2]))
+        x[1::2] = np.random.uniform(-100, -10, len(x[1::2]))
+        initial_population.append(x)
     for _ in range(n_per):
-        x = np.zeros(n)
-        x[::2] = 1e30
-        x[1::2] = 1e-40
-        initial_population.append(x.astype(np.float32))
-    for _ in range(POPULATION_SIZE - 4 * n_per):
+        initial_population.append(np.random.normal(0, 1, n))
+    for _ in range(POPULATION_SIZE - 3 * n_per):
         initial_population.append(flat_seed + np.random.normal(0, 10, n))
     gene_space = None
-initial_population = np.array(initial_population, dtype=np.float32)
+initial_population = np.array(initial_population)
 
 ga_instance = pygad.GA(
     num_generations=NUM_GENERATIONS,
@@ -194,26 +174,24 @@ ga_instance = pygad.GA(
 )
 
 if __name__ == "__main__":
-    print("\nStarting DeepAR Latency Attack\n")
+    print("\nStarting Chronos Latency Attack\n")
     start_time = time.time()
     ga_instance.run()
-    total_time = time.time() - start_time
-    print(f"\nTotal GA time: {total_time:.1f}s")
+    print(f"\nTotal GA time: {time.time() - start_time:.1f}s")
 
-    best_solution, best_fitness, _ = ga_instance.best_solution()
+    best_solution, _, _ = ga_instance.best_solution()
     adv_input = best_solution.reshape(CONTEXT_LEN, NUM_FEATURES).astype(np.float32)
     verify_adv = measure_latency(make_prediction, adv_input, power_monitor, device, 100)
     verify_base = measure_latency(make_prediction, seed_data, power_monitor, device, 100)
-
-    lat_change = ((verify_adv['latency'] / verify_base['latency']) - 1) * 100 if verify_base['latency'] > 0 else 0
+    lat_change = ((verify_adv['latency'] / verify_base['latency']) - 1) * 100
 
     print("\n" + "="*70)
-    print("FINAL RESULTS - DeepAR LATENCY ATTACK")
+    print("FINAL RESULTS - CHRONOS LATENCY ATTACK")
     print("="*70)
     print(f"Latency: {verify_base['latency']*1000:.3f}ms -> {verify_adv['latency']*1000:.3f}ms ({lat_change:+.1f}%)")
     print("="*70)
 
-    prefix = "deepar_latency"
+    prefix = "chronos_latency"
     np.save(f"{prefix}_best_input.npy", best_solution)
     np.savez(f"{prefix}_generation_data.npz", **generation_data)
 
@@ -229,7 +207,6 @@ if __name__ == "__main__":
     axes[0, 1].set_title('Latency Evolution')
     axes[0, 1].grid(True, alpha=0.3)
     axes[1, 0].plot(gens, generation_data['best_power'], 'orange', linewidth=2)
-    axes[1, 0].axhline(BASELINE_POWER, color='gray', linestyle='--')
     axes[1, 0].set_xlabel('Generation')
     axes[1, 0].set_ylabel('Power (W)')
     axes[1, 0].set_title('Power Evolution')
@@ -239,7 +216,7 @@ if __name__ == "__main__":
     axes[1, 1].set_ylabel('CPU %')
     axes[1, 1].set_title('CPU Utilization')
     axes[1, 1].grid(True, alpha=0.3)
-    plt.suptitle('DeepAR Latency Attack Results', fontsize=14, fontweight='bold')
+    plt.suptitle('Chronos Latency Attack Results', fontsize=14, fontweight='bold')
     plt.tight_layout()
     plt.savefig(f"{prefix}_results.png", dpi=150)
     print(f"\nSaved: {prefix}_results.png")
